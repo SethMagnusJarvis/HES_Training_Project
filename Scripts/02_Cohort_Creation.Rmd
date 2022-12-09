@@ -1,0 +1,340 @@
+---
+title: "PH1 HES Training - Cohort Creation"
+author: "S Jarvis"
+date: "12/11/2021"
+output: html_document
+---
+
+```{r HiQ Logo,  echo=FALSE, message=FALSE, warning=FALSE}
+### DO NOT REMOVE ###
+htmltools::img(src = "https://www.healthiq.co.uk/images/healthiq-logo.svg", 
+               alt = 'logo', 
+               style = 'position:absolute; top:0; right:0; padding:10px;')
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r Load libraries}
+### Load basic database libraries
+library(RPostgreSQL)
+library(DBI)
+# Add other packages here:
+library(scales)
+library(tidyverse)
+library(lubridate) #package for date
+library(stringr)
+library(magrittr)
+library(openxlsx)
+library(dbplyr)
+library(RPostgres)
+library(odbc)
+library(janitor)
+library(kableExtra)
+library(ggplot2)
+library(AnalystsHIQ)
+library(data.table)
+library(DT)
+
+```
+
+```{r Format Table Function}
+Formatted_Table <- function(df){
+  
+  df %>%  
+    datatable(extensions = 'Buttons',
+                    rownames = FALSE,
+                    filter = "top",
+                 options = list(dom = 'Blfrtip',
+                                buttons = c('copy', 'csv', 'excel'),
+                                lengthMenu = list(c(10,25,50,-1),
+                                                  c(10,25,50,"All"))))
+}
+```
+
+
+```{r Connection set-up, echo=FALSE, include=FALSE}
+## This chunk should NEVER be included in anything that goes outside of Health iQ.
+# This function sets up your connection to the DB, please edit as appropriate
+hes_con <- DBI::dbConnect(
+  odbc::odbc(), 
+  Driver = "Amazon Redshift (x64)",
+  ### CHANGE WHICH DATABASE YOU WANT
+  Database = "hesdata_processed_hiq",
+  Server = "172.31.32.171",
+  Port = 5439,
+  ### CHANGE THIS TO YOUR DB USERNAME
+  UID = Sys.getenv("db_user"),
+  ### HiQ DB password (do not put your password in plain text here!)
+  PWD = keyring::key_get("cluster_access"))
+```
+
+## Project Description
+
+Primary Hyperoxaluria (PH) constitutes a group of rare inherited disorders of the liver characterised by the overproduction of oxalate, an end-product of metabolism. High levels of oxalate are toxic because oxalate cannot be broken down by the human body and accumulates in the kidneys. Primary Hyperoxaluria Type 1 (PH1) is the most common and severe form, accounting for 70-90% of all PH cases. The client have a subcutaneously administered drug, investigational RNAi therapeutic targeting glycolate oxidase in development for the treatment of PH1. 
+
+The client would like to understand the English PH1 patient population, specifically their demographics, their regional spread and understand their common comorbidities, treatment specialities, and procedures. Additionally, the client would also like to understand the renal health of the PH1 population by tracking the incidence of diagnosis codes attributed to renal health as well as the healthcare resource use and associated costs for PH1 patients with CKD.
+
+
+## Codes
+
+### General Codes
+```{r Table setup}
+schema <- "ph1_hes_training"
+
+#IP_Full <- tbl(hes_con, in_schema("public","inpatient_mapping"))
+#OP_Full <- tbl(hes_con, in_schema("public","outpatient_mapping"))
+
+IP_Filtered <- tbl(hes_con, in_schema(schema, "inpatient_mapping_ph1_pat"))
+OP_Filtered <- tbl(hes_con, in_schema(schema, "outpatient_mapping_ph1_pat"))
+
+codes <- tbl(hes_con, in_schema(schema, "lookup"))
+
+Start_Date <- ymd("2016-04-01")
+End_Date <- ymd("2020-12-31")
+
+inclusion_1 <- filter(codes, category == "Inclusion Part 1") %>% pull(code)
+inclusion_2 <- filter(codes, category == "Inclusion Part 2") %>% pull(code)
+IBD <- filter(codes, category == "IBD") %>% pull(code)
+
+#codes %>% collect() %>% Formatted_Table()
+
+```
+
+## Cohort
+Cohort definition
+Patients shall be included into the Universal PH1 study cohort based upon the presence of ICD-10 diagnosis codes within their available patient record for PH1 (E74.8), and a record of kidney stones (N20.0) and/or nephrocalcinosis (E83.5) at any point within the data. 
+Patients from the Universal PH1 cohort will be stratified into the adult and non-adult cohorts based upon their age at the last date of the study period (31/12/2020). The index date of patients will be defined as the date of their first PH1 coding in the data.
+The index date for all cohorts shall be the first appearance of the patient in the data set that fulfils the inclusion and exclusion criteria.  The follow up period for all patients shall start from their index date until the last interaction in the dataset, or until the last date in the study period, whichever comes earlier.
+
+### Inclusion criteria
+•	Universal PH1 cohort:
+o	ICD-10 code for PH1 (E74.8) in any position within Inpatient or Outpatient within the study period.
+o	Any coding for kidney stones (N20.0) or nephrocalcinosis (E83.5) in Inpatient or Outpatient at any point in the available data.
+•	Adult PH1 cohort:
+o	Patients within the Universal PH1 cohort aged 18 or older at the last date within the study period.
+•	Non-adult PH1 cohort
+o	Patients within the Universal PH1 cohort aged <18 years at the last date within the study period.
+
+### Exclusion criteria
+The exclusion criteria for all cohorts are the following, as they constitute basic data quality issues:
+•	Age missing or recorded as >120
+•	Completely missing sex information, not including the “Not known” and “Not Specified” categories.
+
+
+## Patients Diagnosed With Ph1
+
+
+```{r}
+# Firstly we want to identify patients E748 within our study period. E748 is "Other Specified Disorders of Carbohydrate Metabolism"
+
+#Inpatient
+#Take filtered dataset
+Inc1_Pats_IP <- IP_Filtered %>%
+  #Filter by dates
+  filter(between(disdate, Start_Date, End_Date)) %>%
+  #Filter Diagnosis
+  filter_diags(inclusion_1, collapse = TRUE) %>%
+  mutate(endage = case_when(endage >= 7000 ~ 0,
+                             TRUE ~ endage)) %>%
+  #Find earliest discharge date and age at index date
+  group_by(hesid) %>%
+  mutate(indexdate = min(disdate), 
+         age = min(if_else(endage >= 7000, 0, endage))) %>%
+  ungroup %>%
+  distinct(hesid, indexdate, age) %>%
+  compute()
+
+#Outpatient
+Inc1_Pats_OP <- OP_Filtered %>%
+  filter(between(apptdate, Start_Date, End_Date)) %>%
+  filter_diags(inclusion_1, collapse = TRUE) %>%
+  mutate(apptage = case_when(apptage >= 7000 ~ 0,
+                             TRUE ~ as.numeric(apptage))) %>%
+  group_by(hesid) %>%
+  mutate(indexdate = min(apptdate),
+         age = min(apptage)) %>%
+  ungroup %>%
+  distinct(hesid, indexdate) %>%
+  compute()
+
+#Find Patient Index and upload table of patients with inclusion criteria 1
+#Join inpatient and outpatient data
+Inc1_Pats <- union(Inc1_Pats_IP,Inc1_Pats_OP) %>% collect()
+  #Find earliest of the index dates and ages
+Inc1_Pats <- Inc1_Pats %>% 
+  group_by(hesid) %>%
+  mutate(indexdate = min(indexdate,na.rm = TRUE),
+         age = min(age, na.rm = TRUE)) %>%
+  distinct(hesid, indexdate, age) %>%
+  compute_d(schema, "inc1_patients")
+
+```
+
+### Patients Diagnosed With Kidney Stones (N200) or Nephrocalcinosis (E835) In The Study Period
+
+```{r Inclusion Criteria 2}
+# Here we're identifying Patients with Kidney Stones or Nephrocalcinosis In IP or OP in the study period
+# We'll then join this with our list of E748 Patients to get the universal cohort
+
+#Inpatient
+Inc2_Pats_IP <- IP_Filtered %>%
+  filter(between(disdate, Start_Date, End_Date)) %>%
+  filter_diags(inclusion_2, collapse = TRUE) %>%
+  distinct(hesid) %>%
+  compute()
+
+
+#Outpatient
+Inc2_Pats_OP <- OP_Filtered %>%
+  filter(between(apptdate, Start_Date, End_Date)) %>%
+  filter_diags(inclusion_2, collapse = TRUE) %>%
+  distinct(hesid) %>%
+  compute()
+
+#Create table patients with inclusion 2
+Inc2_Pats <- union(Inc2_Pats_IP,Inc2_Pats_OP) %>% 
+  compute_d(schema,"inc2_patients")
+
+```
+
+
+### Remove patients with exclusion criteria
+
+```{r Exclusion and universal cohort}
+#Load Inclusion tables
+Inc1_Pats <- tbl(hes_con, in_schema(schema, "inc1_patients"))
+Inc2_Pats <- tbl(hes_con, in_schema(schema, "inc2_patients"))
+
+# Here we're Merging the 2 Inclusion Criteria to create the Universal Cohort
+Inc_Pats <- Inc1_Pats %>%
+  inner_join(Inc2_Pats, by = "hesid") %>%
+  compute()
+
+#Additional Analysis: Excluding IBD and Crohn's Patients From all cohorts
+#Find exclusion criteria in inpatient
+Exclusions_IP <- IP_Filtered %>%
+  semi_join(Inc_Pats, by = "hesid") %>%
+  filter(between(disdate, Start_Date, End_Date)) %>%
+  filter_diags(IBD, collapse = TRUE) %>%
+  distinct(hesid) %>%
+  compute()
+
+#Find exclusion criteria in outpatient
+Exclusions_OP <- OP_Filtered %>%
+  semi_join(Inc_Pats, by = "hesid") %>%
+  filter(between(apptdate, Start_Date, End_Date)) %>%
+  filter_diags(IBD, collapse = TRUE) %>%
+  distinct(hesid) %>%
+  compute()
+
+#Create a table of exclusion criteria
+Exclusions <- Exclusions_IP %>% union(Exclusions_OP) %>%
+  distinct(hesid)
+
+#Join inclusion 1 and 2 patients together, and drop those with exclusions
+Universal_Cohort <- Inc1_Pats %>%
+  inner_join(Inc2_Pats, by = "hesid") %>%
+  anti_join(Exclusions, by = "hesid") %>%
+  compute()
+
+```
+
+### Drop Dead patients
+
+```{r Drop dead patients}
+#Find Patients who had a dead 
+Dead_Patients <- Universal_Cohort %>%
+  inner_join(IP_Filtered, by = "hesid") %>%
+  filter(dismeth == 4) %>%
+  distinct(hesid) %>%
+  compute_d(schema, "dead_patients")
+
+Invalid_Age <- Universal_Cohort %>%
+  anti_join(Dead_Patients, by = "hesid") %>%
+  filter(is.na(age)) %>%
+  compute()
+
+#Drop patients who died.
+Universal_Patients <- Universal_Cohort %>%
+  anti_join(Dead_Patients, by = "hesid") %>%
+  anti_join(Invalid_Age, by = "hesid") %>%
+  rename(index_age = age) %>%
+  compute_d(schema,"universal_cohort")
+
+```
+
+
+
+### Assign cohorts
+
+```{r}
+
+#Adult PH1 Cohort
+Adult_Cohort_Final <- Universal_Patients %>%
+  filter(index_age >= 18)%>%
+  compute
+
+#Non-Adult PH1 Cohort
+Non_Adult_Cohort_Final <- Universal_Patients %>%
+  filter(index_age < 18)%>%
+  compute
+
+#Creating an overall cohort object
+Overall_Cohort <- union_all(
+  #Mark the whole universal cohort as being in a single cohort
+  Universal_Patients %>%
+    mutate(cohort = 0),
+  #Add adult cohort
+  Adult_Cohort_Final %>%
+    mutate(cohort = 1)
+  )%>%
+    union_all(
+  #Add Non-adult cohort
+  Non_Adult_Cohort_Final %>%
+    mutate(cohort = 2)
+  ) %>%
+  compute_d(schema,"overall_cohort")
+
+```
+
+#### Checking The Number Of Patients In Each Cohort
+
+```{r}
+#Count members of the each cohort
+Cohort_Count <- tbl(hes_con, in_schema(schema, "overall_cohort")) %>%
+  distinct(hesid, cohort) %>%
+  count(cohort) %>%
+  arrange(cohort) %>%
+  rename(patients = n, condition = cohort) %>%
+  mutate(condition = case_when(condition == 0 ~ "Universal Cohort (did not die and valid age)",
+                               condition == 1 ~ "Adult at end of study period",
+                               TRUE ~ "Non-adult at end of study period")) %>%
+  collect %>%
+  mutate(condition = factor(condition, c("Adult at end of study period", "Non-adult at end of study period", "Universal Cohort (did not die and valid age)")))
+
+```
+
+## Display: Cohort Counts
+```{r}
+#Create patient funnel
+data.frame(condition = c("PH1", "PH1 & Kidney Stones/Nephrocalcinosis", "With IBD/Chron's", "Without IBD/Chron's", "Died", "Invalid Age", "Alive at End"), 
+           patients = c(Inc1_Pats %>% count() %>% pull(n), 
+                                  Inc2_Pats %>% count() %>% pull(n), 
+                                  Exclusions  %>% count() %>% pull(n), 
+                                  Universal_Cohort %>% count() %>% pull(n),
+                                  Dead_Patients %>% count() %>% pull(n),
+                                  Invalid_Age %>% count() %>% pull(n),
+                                  Universal_Patients %>% count() %>% pull(n))) %>% 
+  union_all(Cohort_Count) %>%
+  mutate(stage = row_number()) %>%
+  select(stage, everything()) %>%
+  Formatted_Table()
+```
+
+## Session Info
+
+In this bit it's always wise to include a session information chunk, that captures specific package and R versions you may be using. This is for reproducibility if a client needs further work much later.
+
+```{r Session Info}
+sessioninfo::session_info()
+```

@@ -1,0 +1,153 @@
+---
+title: "PH1 HES Training -  Data Prep"
+author: "S Jarvis"
+date: "29/11/2021"
+output: html_document
+---
+
+```{r Load libraries}
+### Load basic database libraries
+library(RPostgreSQL)
+library(DBI)
+# Add other packages here:
+library(scales)
+library(tidyverse)
+library(lubridate) #package for date
+library(stringr)
+library(magrittr)
+library(openxlsx)
+library(dbplyr)
+library(RPostgres)
+library(odbc)
+library(janitor)
+library(kableExtra)
+library(ggplot2)
+library(AnalystsHIQ)
+library(readxl)
+
+```
+
+```{r Connection set-up, echo=FALSE, include=FALSE}
+## This chunk should NEVER be included in anything that goes outside of Health iQ.
+# This function sets up your connection to the DB, please edit as appropriate
+hes_con <- DBI::dbConnect(
+  odbc::odbc(), 
+  Driver = "Amazon Redshift (x64)",
+  ### CHANGE WHICH DATABASE YOU WANT
+  Database = "hesdata_processed_hiq",
+  Server = "172.31.32.171",
+  Port = 5439,
+  ### CHANGE THIS TO YOUR DB USERNAME
+  UID = "seth", 
+  ### HiQ DB password (do not put your password in plain text here!)
+  PWD = keyring::key_get("database_access"))
+```
+
+### This uploads the whole table lookup
+
+```{r Copy the full lookup and upload it}
+
+read_xlsx("Codes/lookup_icd10.xlsx") %>%
+  mutate(description = case_when(code == "C841" ~ "Sezary disease",
+                                 code == "C880" ~ "Waldenstrom macroglobulinaemia",
+                                 code == "G375" ~ "Concentric sclerosis [Balo]",
+                                 code == "G610" ~ "Guillain-Barre syndrome",
+                                 code == "H810" ~ "Meniere Disease",
+                                 code == "L705" ~ "Acne excoriee des jeunes filles",
+                                 code == "L813" ~ "Cafe au lait spots",
+                                 code == "M350" ~ "Sicca syndrome [Sjogren]",
+                                 code == "M352" ~ "Behcet disease",
+                                 code == "M911" ~ "Juvenile osteochondrosis of head of femur [Legg-Calve-Perthes]",
+                                 code == "M931" ~ "Kienbock disease of adults",
+                                 TRUE ~ description)) %>%
+  rename(icd10 = code) %>%
+  mutate(condition = "overall") %>%
+  r_to_db(hes_con, "ph1_hes_training", "full_lookup_names", aws_username = "sjarvis@healthiq.co.uk", drop = TRUE)
+
+
+```
+
+### This edits the CCI code
+
+This take the existing CCI codes and adds an extra character 
+
+```{r Edit and upload CCI code}
+
+lookup_ammender_cci <- function(lookup){
+ 
+  LookupAmmended <- lookup %>%
+    select(condition, icd10, weights) %>% 
+    union_all(lookup %>% mutate(new_ICD = paste0(icd10,"1"))) %>%
+    union_all(lookup %>% mutate(new_ICD = paste0(icd10,"2"))) %>%
+    union_all(lookup %>% mutate(new_ICD = paste0(icd10,"3"))) %>%
+    union_all(lookup %>% mutate(new_ICD = paste0(icd10,"4"))) %>%
+    union_all(lookup %>% mutate(new_ICD = paste0(icd10,"5"))) %>%
+    union_all(lookup %>% mutate(new_ICD = paste0(icd10,"6"))) %>%
+    union_all(lookup %>% mutate(new_ICD = paste0(icd10,"7"))) %>%
+    union_all(lookup %>% mutate(new_ICD = paste0(icd10,"8"))) %>%
+    union_all(lookup %>% mutate(new_ICD = paste0(icd10,"9"))) %>%
+    union_all(lookup %>% mutate(new_ICD = paste0(icd10,"X"))) %>%
+    union_all(lookup %>% mutate(new_ICD = paste0(icd10,"D"))) %>%
+    union_all(lookup %>% mutate(new_ICD = icd10)) %>%
+    filter(nchar(new_ICD) <= 4) %>%
+    distinct(condition, icd10, weights, new_ICD) %>%
+    filter(!new_ICD %in% lookup$icd10) %>%
+    bind_rows(lookup %>% select(condition, icd10, weights)) %>%
+    full_join(lookup, by = c("condition", "icd10", "weights")) %>%
+    mutate(OldICD = icd10,
+           icd10 = new_ICD) %>%
+    mutate(icd10 = case_when(is.na(icd10) ~ OldICD,
+                             TRUE ~ icd10)) %>%
+    select(-new_ICD)
+  
+  return(LookupAmmended)
+}
+
+tbl(hes_con, in_schema("public", "lookup_cci_icd10")) %>% 
+  rename(condition = condition_type, icd10 = code) %>%
+  collect() %>% 
+  lookup_ammender_cci() %>% 
+  select(-code_length, -OldICD) %>%
+  r_to_db(hes_con, "ph1_hes_training", "lookup_cci_icd10_ammended", aws_username = "sjarvis@healthiq.co.uk", drop = TRUE)
+
+
+
+```
+
+### Ethnicity
+
+This creates a table of the ethnicity letter code, the definition, and their overall category
+
+```{r Ethnicity Utable}
+Ethnicity_Lookup <- data.frame(ethnos = c("A", "B", "C", "D", "E", "F", "G", "H", "J", "K", "L", "M", "N", "P", "R", "S", "Z", "X", "99"), 
+           definition = c("British (White)" , "Irish (White)", "Any other White background", "White and Black Caribbean (Mixed)", "White and Black African (Mixed)", "White and Asian (Mixed)", "Any other Mixed background", "Indian (Asian or Asian British)", "Pakistani (Asian or Asian British)", "Bangladeshi (Asian or Asian British)", "Any other Asian background", "Caribbean (Black or Black British)", "African (Black or Black British)", "Any other Black background", "Chinese (other ethnic group)", "Any other ethnic group", "Not stated","Not known (prior to 2013)", "Not known (2013 onwards)"), 
+           category = c("White", "White", "White", "Any other ethnic group", "Any other ethnic group", "Any other ethnic group", "Any other ethnic group", "Indian", "Pakistani", "Bangladeshi", "Any other ethnic group", "Black - Caribbean", "Black - African", "Black - Other", "Chinese", "Any other ethnic group", "Not Given", "Not known", "Not known"))
+
+Ethnicity_Lookup %>%
+  r_to_db(hes_con, "ph1_hes_training", "ethnicity_lookup", aws_username = "sjarvis@healthiq.co.uk", drop = TRUE)
+```
+
+### This binds the HCRU lookup tables together
+
+This takes the HCRU table lookups and binds them into a single table which can be used.
+
+```{r Upload HCRU lookup}
+bind_rows(read.xlsx("Codes/Alnylam HCRU FIlters.xlsx", sheet = 1) %>% mutate(category = "Universal"),
+          read.xlsx("Codes/Alnylam HCRU FIlters.xlsx", sheet = 2) %>% mutate(category = "Adult"),
+          read.xlsx("Codes/Alnylam HCRU FIlters.xlsx", sheet = 3) %>% mutate(category = "Non-Adult")) %>%
+  mutate(Code_Type = case_when(Code_Type == "ICD 10" ~ "diag",
+                               Code_Type == "OPCS" ~ "oper",
+                                          TRUE ~ "none")) %>%
+  r_to_db(hes_con, "ph1_hes_training", "hcru_filters", aws_username = "sjarvis@healthiq.co.uk", drop = TRUE)
+
+```
+
+### Copy vantage mapping table
+
+This copies the vantage mapping table so we have a local version which doesn't change.
+
+```{r Copy table lookup Lookup}
+tbl(hes_con, in_schema("public","vantage_mapping_202111")) %>%
+  compute_d(schema, "vantage_mapping_202111")
+```
+

@@ -1,0 +1,559 @@
+---
+title: "PH1 HES Training - Descriptive Statistics"
+author: "S Jarvis"
+date: "12/11/2021"
+output: html_document
+---
+
+We have agreed to produce the following descriptive statistics
+*	Total patients – the number of patients each cohort
+*	Total patients with at least one diagnosis of kidney stones – the number of patients within the PH1 cohorts with at least one diagnosis for kidney stones (N20.0).
+*	Total patients with at least one diagnosis of nephrocalcinosis – the number of patients within the PH1 cohorts with at least one diagnosis for nephrocalcinosis (E83.5).
+*	Age on inclusion – the mean with the standard deviation, median with the IQR, minimum, and maximum age of patients at the last date in the study period.
+*	Age distribution on inclusion by decade.
+*	Sex – the number and percentage of male, female, and unknown patients
+*	Total time in cohort – the total time contributed to the study, calculated from index date to the last available date for each patient, reported in patient-days.
+*	Follow-up – the mean, standard deviation, median, IQR, minimum, and maximum number of days of follow-up for each patient.
+*	Distribution of Charlson Co-morbidity Index.
+*	Ethnicity breakdown
+*	Renal health of patients in followup (time post index date)
+
+
+```{r Load libraries}
+### Load basic database libraries
+library(RPostgreSQL)
+library(DBI)
+# Add other packages here:
+library(scales)
+library(tidyverse)
+library(lubridate) #package for date
+library(stringr)
+library(magrittr)
+library(openxlsx)
+library(dbplyr)
+library(RPostgres)
+library(odbc)
+library(janitor)
+library(kableExtra)
+library(ggplot2)
+library(AnalystsHIQ)
+
+```
+
+```{r Connection set-up, echo=FALSE, include=FALSE}
+## This chunk should NEVER be included in anything that goes outside of Health iQ.
+# This function sets up your connection to the DB, please edit as appropriate
+hes_con <- DBI::dbConnect(
+  odbc::odbc(), 
+  Driver = "Amazon Redshift (x64)",
+  ### CHANGE WHICH DATABASE YOU WANT
+  Database = "hesdata_processed_hiq",
+  Server = "172.31.32.171",
+  Port = 5439,
+  ### CHANGE THIS TO YOUR DB USERNAME
+  UID = "seth", 
+  ### HiQ DB password (do not put your password in plain text here!)
+  PWD = keyring::key_get("database_access"))
+```
+
+
+
+## Descriptive Statistics
+3.3.4.1	Descriptive Statistics:
+•	Total patients – the number of patients with an index date during the study period
+•	Total patients with at least one diagnosis of kidney stones – the number of patients within the PH1 cohorts with at least one diagnosis for kidney stones (N20.0).
+•	Total patients with at least one diagnosis of nephrocalcinosis – the number of patients within the PH1 cohorts with at least one diagnosis for nephrocalcinosis (E83.5).
+•	Age on inclusion – the mean, standard deviation, median, IQR, minimum, and maximum age of patients at the last date in the study period.
+•	Age distribution on inclusion by decade.
+•	Sex – the number and percentage of male, female, and unknown patients
+•	Total time in cohort – the total time contributed to the study, calculated from index date to the last available date for each patient, reported in patient-days.
+•	Follow-up – the mean, standard deviation, median, IQR, minimum, and maximum number of days of follow-up for each patient.
+•	Distribution of Charlson Co-morbidity Index.
+•	Ethnicity breakdown, as defined by NHS Digital:
+o	White 
+o	Black - Caribbean 
+o	Black - African 
+o	Black - Other 
+o	Indian 
+o	Pakistani 
+o	Bangladeshi 
+o	Chinese 
+o	Any other ethnic group 
+o	Not given 
+o	Not known
+
+
+
+### General Codes
+```{r}
+
+schema <- "ph1_hes_training"
+
+Start_Date <- ymd("2015-04-01")
+End_Date <- ymd("2020-12-31")
+
+IP_Filtered <- tbl(hes_con, in_schema(schema, "inpatient_mapping_ph1_pat")) %>%
+  filter(between(disdate, Start_Date, End_Date))
+OP_Filtered <- tbl(hes_con, in_schema(schema, "outpatient_mapping_ph1_pat")) %>%
+  filter(between(apptdate, Start_Date, End_Date))
+
+
+IP_Pivoted <- tbl(hes_con, in_schema(schema, "inpatient_mapping_ph1_pat_pivot")) %>%
+  filter(between(disdate, Start_Date, End_Date))
+
+OP_Pivoted <- tbl(hes_con, in_schema(schema, "outpatient_mapping_ph1_pat_pivot")) %>%
+  filter(between(apptdate, Start_Date, End_Date))
+
+
+Overall_Cohort <- tbl(hes_con, in_schema(schema,"overall_cohort"))
+
+codes <- tbl(hes_con, in_schema(schema, "lookup"))
+
+cci_codes <- tbl(hes_con, in_schema(schema, "lookup_cci_icd10_ammended"))
+
+Ethnicity_Lookup <- tbl(hes_con, in_schema("ph1_hes_training", "ethnicity_lookup"))
+
+codes %>% kable %>% kable_styling()
+```
+
+
+
+### Calculate Age
+•	Age on inclusion – the mean, standard deviation, median, IQR, minimum, and maximum age of patients at their index date.
+•	Age distribution on inclusion by decade.
+
+The Age of patients should be calculated at the last date of the study period. We calculated this in the cohort creation step
+
+
+```{r Age}
+#Categorise age at index
+Age_With_Cat <- Overall_Cohort %>%
+  mutate(age_cat = case_when(index_age < 1 ~ "<1",
+                             between(index_age, 1, 20) ~ as.character(round(index_age, 0)),
+                             index_age < 31 ~ "21-30",
+                             index_age < 41 ~ "31-40",
+                             index_age < 51 ~ "41-50",
+                             index_age < 61 ~ "51-60",
+                             index_age < 71 ~ "61-70",
+                             index_age < 81 ~ "71-80",
+                             index_age < 91 ~ "81-90",
+                             index_age < 101 ~ "91-100",
+                             TRUE ~ ">100")) %>%
+  collect()
+
+#Find Summary Stats
+Age_Summary <- Age_With_Cat %>%
+  #Group age by cohort and calculate summary stats
+  group_by(cohort, .drop = FALSE) %>%
+    summarise(mean = mean(index_age),
+              median = median(index_age),
+              stdev = sd(index_age),
+              maximum = max(index_age),
+              minimum = min(index_age)) %>%
+  ungroup() %>%
+  column_to_rownames("cohort") %>%
+  t() %>%
+  as.data.frame() %>%
+  rownames_to_column("stat")
+
+#Turn age into a category
+Age_Cat_Counts <- Age_With_Cat %>%
+  mutate(age_cat = factor(age_cat, levels = c("<1","1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", 
+                                              "21-30", "31-40", "41-50", "51-60", "61-70", "71-80", "81-90", "91-100", ">100"), ordered = TRUE)) %>%
+  group_by(cohort, age_cat, .drop = FALSE) %>%
+    summarise(counts = n(),
+              .groups = "keep") %>%
+  ungroup() %>%
+  pivot_wider(names_from = cohort, values_from = counts) %>%
+  rename(stat = age_cat)
+
+
+```
+
+
+### Gender
+
+•	Sex – the number and percentage of male, and female patients
+
+```{r Gender}
+#Find all distinct Gender records in IP
+Gender_IP <- Overall_Cohort %>%
+  inner_join(IP_Filtered, by = "hesid") %>%
+  filter(!is.na(sex)) %>%
+  mutate(dataset = 1, sex = as.character(sex)) %>%
+  distinct(dataset, hesid, sex) %>%
+  compute
+
+#Find all distinct gender records in OP
+Gender_OP <- Overall_Cohort %>%
+  inner_join(OP_Filtered, by = "hesid") %>%
+  filter(!is.na(sex)) %>%
+  mutate(dataset = 2) %>%
+  distinct(dataset, hesid, sex) %>%
+  compute
+
+#Find the minimum dataset they have a record of gender in
+Gender <- Gender_IP %>% 
+  union(Gender_OP) %>% 
+  group_by(hesid) %>%
+    filter(dataset == min(dataset)) %>%
+  ungroup %>%
+  inner_join(Overall_Cohort, by = "hesid") %>%
+  compute
+
+#Get the counts of gender by cohort
+Gender_Stat <- Gender %>%
+  count(cohort, sex) %>%
+  mutate(count = as.numeric(n)) %>%
+  select(-n) %>%
+  collect() %>%
+  #Find percentage of total
+  group_by(cohort) %>%
+    mutate(percentage = count / sum(count)) %>%
+  ungroup() %>%
+  #Rearrange dataset
+  pivot_longer(count:percentage, names_to = "stat", values_to = "value") %>%
+  pivot_wider(names_from = cohort, values_from = value) %>%
+  arrange(sex) %>%
+  rename(category = sex)
+
+```
+
+### Time in cohort
+•	Total time in cohort – the total time contributed to the study, calculated from index date to the last available date for each patient, reported in patient-days.
+
+```{r Time in Cohort}
+#Find last available 
+Cohort_Time <- IP_Filtered %>%
+  distinct(hesid, disdate) %>%
+  union_all(OP_Filtered %>%
+            select(hesid, disdate = apptdate) %>%
+            distinct(hesid, disdate)) %>%
+  #Find maximum observation
+  group_by(hesid) %>%
+    summarise(max_obs = max(disdate, na.rm = TRUE)) %>%
+  ungroup() %>%
+  #Join to cohort
+  inner_join(Overall_Cohort, by = "hesid") %>%
+  select(hesid, cohort, indexdate, max_obs) %>%
+  #Get time in cohort in days and months
+  mutate(time_in_cohort = max_obs - indexdate,
+         months_in_cohort = time_in_cohort/30) %>%
+  compute()
+
+#Calculate summary stats by cohort
+Cohort_Time_Stats <- Cohort_Time %>%
+  collect() %>%
+  group_by(cohort) %>%
+    summarise(total_time = sum(time_in_cohort),
+              mean = mean(months_in_cohort),
+              median = median(months_in_cohort),
+              stdev = sd(months_in_cohort),
+              maximum = max(months_in_cohort),
+              minimum = min(months_in_cohort)) %>%
+  ungroup() %>%
+  column_to_rownames("cohort") %>%
+  t() %>%
+  as.data.frame() %>%
+  rownames_to_column("stat")
+```
+
+### Ethnicity Breakdown
+•	Ethnicity breakdown, as defined by NHS Digital:
+o	White 
+o	Black - Caribbean 
+o	Black - African 
+o	Black - Other 
+o	Indian 
+o	Pakistani 
+o	Bangladeshi 
+o	Chinese 
+o	Any other ethnic group 
+o	Not given 
+o	Not known
+
+
+```{r Ethnicity}
+
+#Find ethnicity records in IP
+Ethnicity_IP <- Overall_Cohort %>%
+  inner_join(IP_Filtered, by = "hesid") %>%
+  #find time from index
+  mutate(index_time = abs(disdate-indexdate)) %>%
+  filter(!is.na(ethnos)) %>%
+  #find the event closest to index
+  group_by(hesid) %>%
+    filter(index_time == min(index_time)) %>%
+  ungroup %>%
+  mutate(dataset = 1) %>%
+  distinct(hesid, ethnos, dataset, index_time) %>%
+  compute
+  
+#Find ethnicity records in OP
+Ethnicity_OP <- Overall_Cohort %>%
+  inner_join(OP_Filtered, by = "hesid") %>%
+  mutate(index_time = abs(apptdate-indexdate)) %>%
+  filter(!is.na(ethnos)) %>%
+  group_by(hesid) %>%
+  filter(index_time == min(index_time)) %>%
+  ungroup %>%
+  mutate(dataset = 2) %>%
+  distinct(hesid, ethnos, dataset, index_time) %>%
+  compute
+
+#Union ethnicity results
+Ethnicity <- union(Ethnicity_IP,Ethnicity_OP) %>%
+  filter(!is.na(ethnos)) %>%
+  #Join ethnicity lookups 
+  inner_join(Ethnicity_Lookup, by = "ethnos") %>%
+  #Tag any which are not known as not known
+  mutate(known = case_when(category %in% c("Not known", "Not Given") ~ 0,
+                          TRUE ~ 1)) %>%
+  #Find the minimum dataset and the maximum known for each thing
+  group_by(hesid) %>%
+    filter(dataset == min(dataset)) %>%
+    filter(known == max(known)) %>%
+  ungroup() %>%
+  distinct(hesid, category) %>%
+  group_by(hesid, category) %>%
+    mutate(count = n()) %>%
+  ungroup() %>%
+  mutate(category = case_when(count >= 2 ~ "Not known",
+                              TRUE ~ category)) %>%
+  distinct(hesid, category) %>%
+  inner_join(Overall_Cohort, by = "hesid") %>%
+  compute()
+
+#Get counts of each type of ethnicity
+Ethnicity_Stats <- Ethnicity %>%
+  collect() %>%
+  #Turn ethnicity into a factor to amke it easy to arrange
+  mutate(category = factor(category, levels = c("White", "Black - Caribbean", "Black - African", "Black - Other", "Indian", "Pakistani", "Bangladeshi", "Chinese", "Any other ethnic group", "Not Given", "Not known"))) %>%
+  #Count ethnicity by cohort and don't drop any missing ones
+  group_by(cohort, category, .drop = FALSE) %>%
+    summarise(counts = n()) %>%
+  ungroup() %>%
+  #Pivot ethnicity wider by cohort
+  pivot_wider(names_from = cohort, values_from = counts) %>%
+  mutate(across(where(is.integer), as.numeric),
+         across(where(is.numeric), coalesce, 0)) %>%
+  arrange(category) %>%
+  rename(stat = category)
+
+```
+
+
+### Calculate CCI
+•	Distribution of Charlson Co-morbidity Index.
+
+```{r CCI}
+#Find CCI events in IP dataset
+CCI_IP <- IP_Pivoted %>%
+  filter(code_type == "diag") %>%
+  mutate(code = str_sub(code, 1, 4)) %>%
+  inner_join(cci_codes, by = c("code" = "icd10")) %>%
+  rename(obsdate = disdate) %>%
+  distinct(hesid, code, condition, weights, obsdate) %>% 
+  mutate(origin = "IP") %>%
+  compute()
+
+#Find CCI events in OP dataset
+CCI_OP <- OP_Pivoted %>%
+  filter(code_type == "diag") %>%
+  mutate(code = str_sub(code, 1, 4)) %>%
+  inner_join(cci_codes, by = c("code" = "icd10")) %>%
+  rename(obsdate = apptdate) %>%
+  distinct(hesid, code, condition, weights, obsdate) %>% 
+  mutate(origin = "OP") %>%
+  compute()
+
+#Join IP and OP data and find distinct conditions and weights per patient
+CCI_Union <- CCI_IP %>%
+  union_all(CCI_OP) %>%
+  inner_join(Overall_Cohort, by = "hesid") %>%
+  filter(obsdate <= indexdate) %>%
+  distinct(hesid, cohort, condition, weights) %>%
+  compute()
+
+#Find CCI score for each patient
+CCI_Summaries <- CCI_Union %>%
+  group_by(hesid, cohort) %>%
+    summarise(cci = sum(weights)) %>%
+  ungroup() %>%
+  right_join(Overall_Cohort %>% select(hesid, cohort), by = c("hesid", "cohort")) %>%
+  mutate(cci = coalesce(as.numeric(cci), 0)) %>%
+  mutate(cci_grouping = case_when(cci > 12 ~ ">12",
+                                  TRUE ~ as.character(cci))) %>%
+  compute()
+
+#Categorise CCI and count patients per category
+CCI_Stats <- CCI_Summaries %>%
+  collect() %>%
+  mutate(cci_grouping = factor(cci_grouping, c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", ">12"), ordered = TRUE)) %>%
+  distinct(hesid, cohort, cci_grouping) %>%
+  group_by(cohort, cci_grouping, .drop=FALSE) %>%
+    summarise(n = as.numeric(n())) %>%
+  ungroup() %>%
+  pivot_wider(names_from = cohort, values_from = n) %>%
+  rename(stat = cci_grouping)
+  
+```
+
+### Assessing Renal Health Post Index
+•	Kidney Stones
+•	Dialysis
+•	Kidney transplantation
+•	Liver transplantation
+•	Concomitant liver and kidney transplantation
+•	Haematuria
+•	Renal failure
+•	Urinary tract infection
+•	Chronic kidney disease
+
+
+
+```{r Comorbidities}
+
+#Find comorbidities in IP
+Comorbid_IP <- IP_Pivoted %>%
+  filter(code_type == "diag") %>%
+  mutate(code = str_sub(code, 1, 4)) %>%
+  inner_join((codes %>% filter(code.type == "ICD")), by = "code") %>%
+  union_all(IP_Pivoted %>%
+    filter(code_type == "oper") %>%
+    mutate(code = str_sub(code, 1, 4)) %>%
+    inner_join((codes %>% filter(code.type == "OPCS")), by = "code")) %>%
+  rename(obsdate = disdate) %>%
+  distinct(hesid, code, category, obsdate) %>% 
+  mutate(origin = "IP") %>%
+  filter(!category %in% c("Inclusion Part 1", "Inclusion Part 2")) %>%
+  compute()
+
+#Find comorbidities in OP
+Comorbid_OP <- OP_Pivoted %>%
+  filter(code_type == "diag") %>%
+  mutate(code = str_sub(code, 1, 4)) %>%
+  inner_join((codes %>% filter(code.type == "ICD")), by = "code") %>%
+  union_all(OP_Pivoted %>%
+    filter(code_type == "oper") %>%
+    mutate(code = str_sub(code, 1, 4)) %>%
+    inner_join((codes %>% filter(code.type == "OPCS")), by = "code")) %>%
+  rename(obsdate = apptdate) %>%
+  distinct(hesid, code, category, obsdate) %>% 
+  mutate(origin = "OP") %>%
+  filter(!category %in% c("Inclusion Part 1", "Inclusion Part 2")) %>%
+  compute()
+
+#Union IP and OP events
+Union_Comorbid <- Comorbid_IP %>%
+  union_all(Comorbid_OP) %>%
+  distinct(hesid, code, category, obsdate, origin) %>%
+  compute()
+
+#This looks for kidney and liver transplants on the same day
+Transplant_Concurrent <- Union_Comorbid %>%
+  select(-origin, -code) %>%
+  filter(category %in% c("Kidney transplantation", "Liver transplantation")) %>%
+  pivot_wider(names_from = category, values_from = obsdate) %>%
+  rename(kidney = "Kidney transplantation", liver = "Liver transplantation") %>%
+  mutate(concurrent = case_when(!is.na(kidney) & kidney == liver ~ kidney,
+                               TRUE ~ NA)) %>%
+  select(hesid, obsdate = concurrent) %>%
+  filter(!is.na(obsdate)) %>%
+  mutate(category = "Concurrent transplant") %>%
+  compute()
+
+#Find observations after index
+Union_Conditions <- Union_Comorbid %>%
+  distinct(hesid, obsdate, category) %>% 
+  union_all(Transplant_Concurrent) %>%
+  right_join(Overall_Cohort %>% distinct(hesid, indexdate), by = "hesid") %>%
+  filter(obsdate >= indexdate) %>%
+  right_join(Overall_Cohort, by = c("hesid", "indexdate")) %>%
+  collect() %>%
+  #Set Conditions to factors
+  mutate(category = factor(category, levels = c("Kidney Stones", "Dialysis", "Kidney transplantation", "Liver transplantation", "Concurrent transplant", "Haematuria", 
+                                                "Renal failure", "Urinary tract infection", "Chronic kidney disease", "CKD Stage 1", "CKD Stage 2", "CKD Stage 3",
+                                                "CKD Stage 4", "CKD Stage 5", "Nephrocalcinosis"), ordered = TRUE)) %>%
+  group_by(hesid, cohort, indexdate, category, .drop = FALSE) %>%
+    summarise(events = n(),
+              .groups = "keep") %>%
+  ungroup() %>%
+  compute()
+
+#Find number of years per cohort to find events per year.
+Years_Per_Cohort <- Cohort_Time_Stats %>% 
+  filter(stat == "total_time") %>% 
+  pivot_longer('0':'2', names_to = "cohort") %>% 
+  mutate(value = value/365,
+         cohort = as.numeric(cohort)) %>%
+  select(-stat)
+
+#Get summary stats
+Union_Conditions_Stat <- Union_Conditions %>%
+  filter(events > 0) %>%
+  inner_join(Years_Per_Cohort, by = "cohort") %>%
+  group_by(cohort, category, .drop = FALSE) %>%
+    summarise(Total_Events = sum(events),
+              Patients = n(),
+              Incidence_Per_Year = Total_Events / max(value)) %>%
+  ungroup() %>%
+  filter(category != "Nephrocalcinosis") %>%
+  collect() %>%
+  pivot_longer(Total_Events:Incidence_Per_Year, names_to = "stat", values_to = "n") %>%
+  pivot_wider(names_from = cohort, values_from = n)
+  
+
+```
+
+### Find total patients, and the number with kidney stones and nephrocalcionis
+
+•	Total patients – the number of patients with an index date during the study period
+•	Total patients with at least one diagnosis of kidney stones – the number of patients within the PH1 cohorts with at least one diagnosis for kidney stones (N20.0).
+•	Total patients with at least one diagnosis of nephrocalcinosis – the number of patients within the PH1 cohorts with at least one diagnosis for nephrocalcinosis (E83.5).
+
+
+
+```{r Get cohort inclusion values}
+#Count patients per cohort
+Overall_Counts <- Overall_Cohort %>% 
+  count(cohort) %>%
+  mutate(n = as.numeric(n),
+         stat = "Total") %>%
+  pivot_wider(names_from = cohort, values_from = n) %>%
+  collect() %>%
+  select(stat, "0", "1", "2")
+
+#Count the number of patients with each of kidney stones and nephrocalcinosis at any point
+Inclusion_Counts <- Union_Comorbid %>%
+  distinct(hesid, obsdate, category) %>% 
+  inner_join(Overall_Cohort, by = "hesid") %>%
+  collect() %>%
+  filter(category %in% c("Kidney Stones", "Nephrocalcinosis")) %>%
+  count(hesid, cohort, category) %>% 
+  group_by(cohort, category, .drop = FALSE) %>%
+    summarise(n = n()) %>%
+  ungroup() %>%
+  rename(stat = category) %>%
+  pivot_wider(names_from = cohort, values_from = n) %>%
+  select(stat, "0", "1", "2")
+
+```
+
+## Join tables into output
+
+```{r Join Tables}
+#Join all of the stats tables together
+Final_Table <- Overall_Counts %>%
+  union_all(Inclusion_Counts) %>%
+  union_all(Age_Summary) %>%
+  union_all(Age_Cat_Counts) %>%
+  union_all(Gender_Stat) %>%
+  union_all(Cohort_Time_Stats) %>%
+  union_all(Ethnicity_Stats) %>%
+  union_all(CCI_Stats) %>%
+  union_all(Union_Conditions_Stat)
+
+write.xlsx(Final_Table, "Output/Descriptive_Stats_Table.xlsx")
+```
+

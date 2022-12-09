@@ -1,0 +1,356 @@
+---
+title: "PH1 HES Training - Ranked Analysis"
+author: "S Jarvis"
+date: "20/01/2022"
+output: html_document
+---
+
+
+```{r Load libraries}
+### Load basic database libraries
+library(RPostgreSQL)
+library(DBI)
+# Add other packages here:
+library(scales)
+library(tidyverse)
+library(lubridate) #package for date
+library(stringr)
+library(magrittr)
+library(openxlsx)
+library(dbplyr)
+library(RPostgres)
+library(odbc)
+library(janitor)
+library(kableExtra)
+library(ggplot2)
+library(AnalystsHIQ)
+
+```
+
+```{r Connection set-up, echo=FALSE, include=FALSE}
+## This chunk should NEVER be included in anything that goes outside of Health iQ.
+# This function sets up your connection to the DB, please edit as appropriate
+hes_con <- DBI::dbConnect(
+  odbc::odbc(), 
+  Driver = "Amazon Redshift (x64)",
+  ### CHANGE WHICH DATABASE YOU WANT
+  Database = "hesdata_processed_hiq",
+  Server = "172.31.32.171",
+  Port = 5439,
+  ### CHANGE THIS TO YOUR DB USERNAME
+  UID = "seth", 
+  ### HiQ DB password (do not put your password in plain text here!)
+  PWD = keyring::key_get("database_access"))
+```
+
+## Short summary
+
+This is a version of the ranked analysis where the cutoff points are picked manually.
+
+For the Adult and Non-Adult subcohorts we have been asked to produce ranked analysis of:
+*	Top 100 Primary Diagnosis (Diagnosis in the primary position)
+*	Top 100 Secondary diagnosis (Diagnosis not in the primary position)
+*	Top 100 Procedures (In any position)
+*	Top 20 treatment specialties of clinicians (found by the tretspef)
+
+### General Codes
+```{r}
+
+schema <- "ph1_hes_training"
+
+Start_Date <- ymd("2015-04-01")
+End_Date <- ymd("2020-12-31")
+
+IP_Filtered <- tbl(hes_con, in_schema(schema, "inpatient_mapping_ph1_pat")) %>%
+  filter(between(disdate, Start_Date, End_Date))
+OP_Filtered <- tbl(hes_con, in_schema(schema, "outpatient_mapping_ph1_pat")) %>%
+  filter(between(apptdate, Start_Date, End_Date))
+
+IP_Pivoted <- tbl(hes_con, in_schema(schema, "inpatient_mapping_ph1_pat_pivot")) %>%
+  filter(between(disdate, Start_Date, End_Date))
+
+OP_Pivoted <- tbl(hes_con, in_schema(schema, "outpatient_mapping_ph1_pat_pivot")) %>%
+  filter(between(apptdate, Start_Date, End_Date))
+
+Overall_Cohort <- tbl(hes_con, in_schema(schema,"overall_cohort"))
+
+codes <- tbl(hes_con, in_schema(schema, "lookup"))
+
+Full_Code_Lookup <- tbl(hes_con, in_schema(schema,"full_lookup_names"))
+
+```
+
+```{r Filter Function}
+
+#Create function to filter rows based on the ranks
+#Ranking_Dataset is the dataset to be used
+#Highest_Row is the highest number of events desired
+#Over should be set to true if you are happy with having more than 100 rows, and false if you aren't
+#If True it drops the rank which has 
+Filter_Rows_Under_Max <- function(Ranking_Dataset, Highest_Row = 100, Over = TRUE){
+  
+  #Don't filter anything if the highest row is higher than the dataset
+  if(Highest_Row > unlist(Ranking_Dataset %>% count() %>% pull(n))){
+    print("Your max value is longer than your DF, no rows have been filtered.")
+    return(Ranking_Dataset)
+  }
+  
+  #Arrange dataset by appointments then patients and assign row number
+  Keep_DF <- Ranking_Dataset %>%
+    arrange(ranking) %>%
+    mutate(row = row_number()) %>%
+    #Group by the rank and find the maximum and minimum row of that rank
+    group_by(ranking) %>%
+      mutate(max_row = max(row),
+             min_row = min(row)) %>%
+    ungroup() %>%
+    #If Over is true then keep all those which have a minimum row under the ranking level
+    #If Over is false keep those with a maximum row under the highest row level.
+    mutate(keep = case_when(Over == TRUE & min_row <= Highest_Row ~ TRUE,
+                            Over == FALSE & max_row <= Highest_Row ~ TRUE,
+                            TRUE ~ FALSE)) %>%
+    filter(keep == TRUE) %>%
+    select(-row, - min_row, -max_row) %>% 
+    compute()
+  
+  return(Keep_DF)
+    
+}
+```
+
+
+### Primary Diagnosis
+```{r Primary Diag}
+
+# Join cohort to filtered dataset
+Primary_Diags <- Overall_Cohort %>%
+  inner_join(IP_Pivoted, by = "hesid") %>%
+  #Filter to only use primary diagnosis
+  filter(prim == 1) %>%
+  select(cohort, hesid, disdate, code) %>%
+  rename(value = code) %>%
+  filter(!is.na(value)) %>%
+  #select only the first 4 characters from primary diag column
+  mutate(icd10 = substring(value,1,4)) %>%
+  #Join to list of all codes for descriptions
+  inner_join(Full_Code_Lookup, by = "icd10") %>%
+  select(cohort, hesid, icd10, description) %>%
+  compute()
+
+#Count number of times each patient has each icd code
+Primary_Ranking <- Primary_Diags %>%
+  count(hesid, cohort, icd10, description) %>%
+  ungroup() %>%
+  #Count the number of patients who have each icd code, and the total number of appointments with it
+  group_by(cohort, icd10, description) %>%
+    summarise(n_pat = as.numeric(n()),
+              n_appointments = as.numeric(sum(n))) %>%
+  ungroup() %>%
+  #Collect before running the section below otherwise it will rank things incorrectly
+  collect() %>%
+  #Rank ICD codes by number of appointments with them
+  group_by(cohort) %>%
+    arrange(desc(n_appointments), desc(n_pat)) %>%
+    #If prior number of appointments and number of patients is the same set to 0, otherwise set to 1
+    #Otherwise set to 1
+    mutate(differ_prior = case_when(lag(n_appointments) == n_appointments & lag(n_pat) == n_pat ~ 0,
+                                   TRUE ~ 1)) %>%
+    #Cumsum the different prior to get rankings
+    mutate(ranking = cumsum(differ_prior)) %>%
+  ungroup() %>%
+  select(-differ_prior)
+  
+
+#Find only the adult cohort
+Primary_Diag_Adult_Rank <- Primary_Ranking %>%
+  filter(cohort == 1) %>%
+  #Run function
+  Filter_Rows_Under_Max(100, FALSE) %>%
+  #Order the rows
+  arrange(ranking, desc(n_appointments), desc(n_pat)) %>%
+  select(ranking, icd10, description, n_pat, n_appointments)
+
+Primary_Diag_Non_Adult_Rank <- Primary_Ranking %>%
+  filter(cohort == 2) %>%
+  Filter_Rows_Under_Max(100, FALSE) %>%
+  arrange(ranking, desc(n_appointments), desc(n_pat)) %>%
+  select(ranking, icd10, description, n_pat, n_appointments)
+```
+
+### Secondary Diagnoses
+```{r Secondary Diag}
+
+Secondary_Diags <- Overall_Cohort %>%
+  inner_join(IP_Filtered, by = "hesid") %>%
+  select(cohort, hesid, disdate, diag_02) %>%
+  rename(value = diag_02) %>%
+  filter(!is.na(value)) %>%
+  mutate(icd10 = substring(value,1,4)) %>%
+  inner_join(Full_Code_Lookup, by = "icd10") %>%
+  select(cohort, hesid, icd10, description) %>%
+  compute()
+
+Secondary_Ranking <- Primary_Diags %>%
+  count(hesid, cohort, icd10, description) %>%
+  ungroup() %>%
+  group_by(cohort, icd10, description) %>%
+    summarise(n_pat = as.numeric(n()),
+              n_appointments = as.numeric(sum(n))) %>%
+  ungroup() %>%
+  #Collect before running the section below otherwise it will rank things incorrectly
+  collect() %>%
+  #Rank ICD codes by number of appointments with them
+  group_by(cohort) %>%
+    arrange(desc(n_appointments), desc(n_pat)) %>%
+    #If prior number of appointments and number of patients is the same set to 0, otherwise set to 1
+    #Otherwise set to 1
+    mutate(differ_prior = case_when(lag(n_appointments) == n_appointments & lag(n_pat) == n_pat ~ 0,
+                                   TRUE ~ 1)) %>%
+    #Cumsum the different prior to get rankings
+    mutate(ranking = cumsum(differ_prior)) %>%
+  ungroup() %>%
+  select(-differ_prior)
+
+Secondary_Diag_Adult_Rank <- Secondary_Ranking %>%
+  filter(cohort == 1) %>%
+  Filter_Rows_Under_Max(100, FALSE) %>%
+  arrange(ranking, desc(n_appointments), desc(n_pat)) %>%
+  select(ranking, icd10, description, n_pat, n_appointments) %>%
+  collect()
+  
+Secondary_Diag_Non_Adult_Rank <- Secondary_Ranking %>%
+  filter(cohort == 2) %>%
+  Filter_Rows_Under_Max(100, FALSE) %>%
+  arrange(ranking, desc(n_appointments), desc(n_pat)) %>%
+  select(ranking, icd10, description, n_pat, n_appointments) %>%
+  collect()
+
+```
+
+### Procedure Ranking
+```{r Procedures}
+Procedure_Names <- tbl(hes_con, in_schema(schema,"vantage_mapping_202111")) %>% 
+  filter(str_detect(category, "proc")) %>%
+  rename(opcs4 = code, desc4 = value) %>%
+  select(opcs4, description = desc4) %>%
+  compute
+
+# Important to filter out Primary Opernosis as well as NAs and blanks
+Procedures <- Overall_Cohort %>%
+  inner_join(IP_Pivoted, by = "hesid") %>%
+  filter(code_type == "oper") %>%
+  select(cohort, hesid, disdate, code_type, code) %>%
+  rename(value = code) %>%
+  filter(!is.na(value)) %>% 
+  filter(!value == "") %>%
+  mutate(opcs4 = substring(value,1,4)) %>%
+  left_join(Procedure_Names, by = "opcs4") %>%
+  select(cohort, hesid, opcs4, description) %>%
+  compute()
+
+Procedure_Ranking <- Procedures %>% 
+  count(hesid, opcs4, cohort, description) %>%
+  ungroup() %>%
+  group_by(cohort, opcs4, description) %>%
+    summarise(n_pat = as.numeric(n()),
+              n_appointments = as.numeric(sum(n))) %>%
+  ungroup() %>%
+  #Collect before running the section below otherwise it will rank things incorrectly
+  collect() %>%
+  #Rank ICD codes by number of appointments with them
+  group_by(cohort) %>%
+    arrange(desc(n_appointments), desc(n_pat)) %>%
+    #If prior number of appointments and number of patients is the same set to 0, otherwise set to 1
+    #Otherwise set to 1
+    mutate(differ_prior = case_when(lag(n_appointments) == n_appointments & lag(n_pat) == n_pat ~ 0,
+                                   TRUE ~ 1)) %>%
+    #Cumsum the different prior to get rankings
+    mutate(ranking = cumsum(differ_prior)) %>%
+  ungroup() %>%
+  select(-differ_prior)
+
+Procedures_Adult_Rank <- Procedure_Ranking %>%
+  filter(cohort == 1) %>%
+  Filter_Rows_Under_Max(100, FALSE) %>%
+  arrange(ranking, desc(n_appointments), desc(n_pat)) %>%
+  select(ranking, opcs4, description, n_pat, n_appointments) %>%
+  collect()
+  
+Procedures_Non_Adult_Rank <- Procedure_Ranking %>%
+  filter(cohort == 2) %>%
+  Filter_Rows_Under_Max(100, FALSE) %>%
+  arrange(ranking, desc(n_appointments), desc(n_pat)) %>%
+  select(ranking, opcs4, description, n_pat, n_appointments) %>%
+  collect()
+
+```
+
+
+### Treatment Specialities
+```{r}
+
+Tretspef_Names <- tbl(hes_con, in_schema(schema,"vantage_mapping_202111")) %>% 
+  filter(category == "tretspef") %>%
+  rename(tretspef = code, description = value) %>%
+  select(tretspef, description) %>%
+  compute()
+
+# Important to filter out Primary Diagnosis as well as NAs and blanks
+Tretspefs <- Overall_Cohort %>%
+  inner_join(IP_Filtered, by = "hesid") %>%
+  select(cohort, hesid, disdate, tretspef) %>%
+  inner_join(Tretspef_Names, by = "tretspef") %>%
+  select(cohort, hesid, tretspef, description) %>%
+  compute()
+
+Treatspef_Ranking <- Tretspefs %>%
+  count(hesid, cohort, description) %>%
+  ungroup() %>%
+  group_by(cohort, description) %>%
+    summarise(n_pat = as.numeric(n()),
+              n_appointments = as.numeric(sum(n))) %>%
+  ungroup() %>%
+  #Collect before running the section below otherwise it will rank things incorrectly
+  collect() %>%
+  #Rank ICD codes by number of appointments with them
+  group_by(cohort) %>%
+    arrange(desc(n_appointments), desc(n_pat)) %>%
+    #If prior number of appointments and number of patients is the same set to 0, otherwise set to 1
+    #Otherwise set to 1
+    mutate(differ_prior = case_when(lag(n_appointments) == n_appointments & lag(n_pat) == n_pat ~ 0,
+                                   TRUE ~ 1)) %>%
+    #Cumsum the different prior to get rankings
+    mutate(ranking = cumsum(differ_prior)) %>%
+  ungroup() %>%
+  select(-differ_prior)
+
+Treatspef_Adult_Rank <- Treatspef_Ranking %>%
+  filter(cohort == 1) %>%
+  Filter_Rows_Under_Max(20, FALSE) %>%
+  arrange(ranking, desc(n_appointments), desc(n_pat)) %>%
+  select(ranking, description, n_pat, n_appointments) %>%
+  collect()
+  
+Treatspef_Non_Adult_Rank <- Treatspef_Ranking %>%
+  filter(cohort == 2) %>%
+  Filter_Rows_Under_Max(20, FALSE) %>%
+  arrange(ranking, desc(n_appointments), desc(n_pat)) %>%
+  select(ranking, description, n_pat, n_appointments) %>%
+  collect()
+
+```
+
+## Write each table as a tab
+
+```{r}
+write.xlsx(list("Primary Diagnosis Adult" = Primary_Diag_Adult_Rank, 
+                "Primary Diagnosis Non-Adult" = Primary_Diag_Non_Adult_Rank, 
+                "Secondary Diagnosis Adult" = Secondary_Diag_Adult_Rank, 
+                "Secondary Diagnosis Non-Adult" = Secondary_Diag_Non_Adult_Rank, 
+                "Procedures Adult" = Procedures_Adult_Rank, 
+                "Procedures Non-Adult" = Procedures_Non_Adult_Rank, 
+                "Tretspef Adult" = Treatspef_Adult_Rank, 
+                "Tretspef Non-Adult" = Treatspef_Non_Adult_Rank), 
+           "Output/Ranked_Analysis.xlsx")
+```
+

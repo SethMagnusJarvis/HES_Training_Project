@@ -1,0 +1,201 @@
+---
+title: "PH1 HES Training - HCRU"
+author: "S Jarvis"
+date: "26/01/2022"
+output: html_document
+---
+
+```{r Load libraries}
+### Load basic database libraries
+library(RPostgreSQL)
+library(DBI)
+# Add other packages here:
+library(scales)
+library(tidyverse)
+library(lubridate) #package for date
+library(stringr)
+library(magrittr)
+library(openxlsx)
+library(dbplyr)
+library(RPostgres)
+library(odbc)
+library(janitor)
+library(kableExtra)
+library(ggplot2)
+library(AnalystsHIQ)
+
+```
+
+```{r Connection set-up, echo=FALSE, include=FALSE}
+## This chunk should NEVER be included in anything that goes outside of Health iQ.
+# This function sets up your connection to the DB, please edit as appropriate
+hes_con <- DBI::dbConnect(
+  odbc::odbc(), 
+  Driver = "Amazon Redshift (x64)",
+  ### CHANGE WHICH DATABASE YOU WANT
+  Database = "hesdata_processed_hiq",
+  Server = "172.31.32.171",
+  Port = 5439,
+  ### CHANGE THIS TO YOUR DB USERNAME
+  UID = "seth", 
+  ### HiQ DB password (do not put your password in plain text here!)
+  PWD = keyring::key_get("database_access"))
+```
+
+### General Codes
+```{r}
+
+schema <- "ph1_hes_training"
+
+Start_Date <- ymd("2015-04-01")
+End_Date <- ymd("2020-12-31")
+
+IP_Filtered <- tbl(hes_con, in_schema(schema, "inpatient_mapping_ph1_pat")) %>%
+  filter(between(disdate, Start_Date, End_Date))
+OP_Filtered <- tbl(hes_con, in_schema(schema, "outpatient_mapping_ph1_pat")) %>%
+  filter(between(apptdate, Start_Date, End_Date))
+
+
+IP_Pivoted <- tbl(hes_con, in_schema(schema, "inpatient_mapping_ph1_pat_pivot")) %>%
+  filter(between(disdate, Start_Date, End_Date)) %>%
+  mutate(code = substring(code,1,4)) %>%
+  compute()
+
+
+OP_Pivoted <- tbl(hes_con, in_schema(schema, "outpatient_mapping_ph1_pat_pivot")) %>%
+  filter(between(apptdate, Start_Date, End_Date)) %>%
+  mutate(code = substring(code,1,4)) %>%
+  compute()
+
+
+Overall_Cohort <- tbl(hes_con, in_schema(schema,"overall_cohort"))
+
+codes <- tbl(hes_con, in_schema(schema, "lookup"))
+
+Full_Code_Lookup <- tbl(hes_con, in_schema(schema,"full_lookup_names"))
+
+HCRU_Filter <- tbl(hes_con, in_schema(schema, "hcru_filters"))
+
+```
+
+## Find IP Events of interest
+
+```{r}
+#Elective admitypes according to Casemix
+Elective <-  c("111","112","113","211","212","213")
+
+#Non-Elective admitypes according to Casemix
+Non_Elective <- c("121","122","123","124","125","12A","12B","12C","12D","128","131","132","181","182","183")
+
+# Find IP events of interest
+IP_Events <- IP_Pivoted %>%
+  inner_join(HCRU_Filter, by = c("code", "code_type")) %>%
+  inner_join(Overall_Cohort, by ="hesid") %>%
+  #Filter the events of interest to only the ones for that cohort
+  filter((cohort == 1 & category == "Adult") |  (cohort ==0 & category == "Universal") | (cohort == 2 & category == "Non-Adult")) %>%
+  #find if an admission is overnight/just the day, and if it's elective/non-elective
+  mutate(admitype = paste0(classpat,admimeth), 
+         day_adms = if_else(classpat == 2, "Day_Adms", "Night_Adms"),
+         elective = case_when(admitype %in% Elective ~ "Elective",
+                              admitype %in% Non_Elective ~ "Non-Elective",
+                              TRUE ~ "None")) %>%
+  distinct(hesid, cohort, disdate, day_adms, elective, totalbeddays) %>%
+  compute()
+
+#Get a universal set of events, with both events broken down by type, and overall ones.
+IP_Events_Joined <- IP_Events %>%
+  distinct(hesid, cohort, disdate, totalbeddays) %>%
+  mutate(adm_type = "Universal") %>%
+  union_all(IP_Events %>%
+            pivot_longer(day_adms:elective, names_to = "none", values_to = "adm_type") %>%
+            filter(adm_type != "0" & adm_type != "None" & adm_type != "Night_Adms") %>%
+            select(-none) %>%
+            distinct()) %>%
+  compute()
+
+#Count the number of each type of event, then convert type to factor for sorting
+IP_Events_By_Pat <- IP_Events_Joined %>%
+  group_by(hesid, cohort, adm_type) %>%
+    summarise(n_appointments = n(),
+              n_bed_days = sum(totalbeddays)) %>%
+  ungroup() %>%
+  collect() %>%
+  mutate(adm_type = factor(adm_type, c("Universal", "Day_Adms", "Elective", "Non-Elective"), ordered = TRUE)) %>%
+  distinct()
+
+
+
+```
+
+## Calculate IP stats
+
+```{r}
+#Calculate summary stats
+IP_Overall_Stat <- IP_Events_By_Pat %>%
+  mutate(n_appointments = as.numeric(n_appointments),
+         n_bed_days = as.numeric(n_appointments)) %>%
+  group_by(cohort, adm_type, .drop = FALSE) %>%
+    summarise(n_appt = sum(n_appointments),
+              mean_appt = mean(n_appointments),
+              median_appt = median(n_appointments),
+              minimum_appt = min(n_appointments),
+              maximum_appt = max(n_appointments),
+              sd_appt = sd(n_appointments),
+              n_bed = sum(n_bed_days),
+              mean_bed = mean(n_bed_days),
+              median_bed = median(n_bed_days),
+              minimum_bed = min(n_bed_days),
+              maximum_bed = max(n_bed_days),
+              sd_bed = sd(n_bed_days)) %>%
+  ungroup() %>%
+  #mutate(across(where(is.integer), as.numeric)) %>%
+  pivot_longer(n_appt:sd_bed, names_to = "stat", values_to = "value") %>%
+  pivot_wider(names_from = cohort, values_from = value) %>%
+  separate(stat, sep = "_", into = c("stat", "type"))
+
+IP_Ordered_Stat <- bind_rows(IP_Overall_Stat %>% 
+  filter(stat == "n" & type == "appt"),
+  Overall_Stat  %>% 
+    filter(stat != "n" & type == "appt"),
+  Overall_Stat  %>% 
+    filter(stat == "n" & type == "bed" & adm_type != "Day_Adms"),
+  Overall_Stat  %>% 
+    filter(stat != "n" & type == "bed" & adm_type != "Day_Adms"))
+
+
+```
+
+## Calculate OP Stats
+
+```{r}
+
+OP_Events <- OP_Pivoted %>%
+  inner_join(HCRU_Filter, by = c("code", "code_type")) %>%
+  inner_join(Overall_Cohort, by ="hesid") %>%
+  filter((cohort == 1 & category == "Adult") |  (cohort ==0 & category == "Universal") | (cohort == 2 & category == "Non-Adult")) %>%
+  compute()
+
+OP_Stats <- OP_Events %>%
+  distinct(hesid, cohort, apptdate) %>%
+  collect() %>%
+  count(hesid, cohort) %>%
+  ungroup() %>%
+   group_by(cohort) %>%
+    summarise(n_appt = sum(n),
+              mean_appt = mean(n),
+              median_appt = median(n),
+              minimum_appt = min(n),
+              maximum_appt = max(n),
+              sd_appt = sd(n)) %>%
+  ungroup() %>%
+  pivot_longer(-cohort, names_to = "stat", values_to = "value") %>%
+  pivot_wider(names_from = cohort, values_from = value)
+  
+```
+
+## Write table to excel
+
+```{r}
+write.xlsx(bind_rows(Ordered_Stat, OP_Stats), "Output/HCRU_Stats.xlsx")
+```
+

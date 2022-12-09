@@ -1,0 +1,260 @@
+---
+title: "PH1 HES Training - Ranked Analysis"
+author: "S Jarvis"
+date: "20/01/2022"
+output: html_document
+---
+
+```{r Load libraries}
+### Load basic database libraries
+library(RPostgreSQL)
+library(DBI)
+# Add other packages here:
+library(scales)
+library(tidyverse)
+library(lubridate) #package for date
+library(stringr)
+library(magrittr)
+library(openxlsx)
+library(dbplyr)
+library(RPostgres)
+library(odbc)
+library(janitor)
+library(kableExtra)
+library(ggplot2)
+library(AnalystsHIQ)
+
+```
+
+```{r Connection set-up, echo=FALSE, include=FALSE}
+## This chunk should NEVER be included in anything that goes outside of Health iQ.
+# This function sets up your connection to the DB, please edit as appropriate
+hes_con <- DBI::dbConnect(
+  odbc::odbc(), 
+  Driver = "Amazon Redshift (x64)",
+  ### CHANGE WHICH DATABASE YOU WANT
+  Database = "hesdata_processed_hiq",
+  Server = "172.31.32.171",
+  Port = 5439,
+  ### CHANGE THIS TO YOUR DB USERNAME
+  UID = "seth", 
+  ### HiQ DB password (do not put your password in plain text here!)
+  PWD = keyring::key_get("database_access"))
+```
+
+### General Codes
+```{r}
+
+schema <- "ph1_hes_training"
+
+Start_Date <- ymd("2015-04-01")
+End_Date <- ymd("2020-12-31")
+
+IP_Filtered <- tbl(hes_con, in_schema(schema, "inpatient_mapping_ph1_pat")) %>%
+  filter(between(disdate, Start_Date, End_Date))
+OP_Filtered <- tbl(hes_con, in_schema(schema, "outpatient_mapping_ph1_pat")) %>%
+  filter(between(apptdate, Start_Date, End_Date))
+
+IP_Pivoted <- tbl(hes_con, in_schema(schema, "inpatient_mapping_ph1_pat_pivot")) %>%
+  filter(between(disdate, Start_Date, End_Date))
+
+OP_Pivoted <- tbl(hes_con, in_schema(schema, "outpatient_mapping_ph1_pat_pivot")) %>%
+  filter(between(apptdate, Start_Date, End_Date))
+
+Overall_Cohort <- tbl(hes_con, in_schema(schema,"overall_cohort"))
+
+codes <- tbl(hes_con, in_schema(schema, "lookup"))
+
+Full_Code_Lookup <- tbl(hes_con, in_schema(schema,"full_lookup_names"))
+
+```
+
+### Primary Diagnosis
+```{r Primary Diag}
+
+# Important to filter out Primary Diagnosis as well as NAs and blanks
+Primary_Diags <- Overall_Cohort %>%
+  inner_join(IP_Filtered, by = "hesid") %>%
+  select(cohort, hesid, disdate, diag_01) %>%
+  rename(value = diag_01) %>%
+  filter(!is.na(value)) %>%
+  mutate(icd10 = substring(value,1,4)) %>%
+  inner_join(Full_Code_Lookup, by = "icd10") %>%
+  select(cohort, hesid, icd10, description) %>%
+  compute()
+
+Primary_Ranking <- Primary_Diags %>%
+  count(hesid, cohort, icd10, description) %>%
+  ungroup() %>%
+  group_by(cohort, icd10, description) %>%
+    summarise(n_pat = as.numeric(n()),
+              n_appointments = as.numeric(sum(n))) %>%
+  ungroup() %>%
+  group_by(cohort) %>%
+    arrange(desc(n_appointments), desc(n_pat)) %>%
+    mutate(ranking = row_number()) %>%
+  ungroup() %>%
+  compute()
+
+Primary_Diag_Adult_Rank <- Primary_Ranking %>%
+  filter(cohort == 1) %>%
+  
+  filter(n_appointments  >= 3) %>%
+  select(ranking, icd10, description, n_pat, n_appointments) %>%
+  collect()
+  
+Primary_Diag_Non_Adult_Rank <- Primary_Ranking %>%
+  filter(cohort == 2) %>%
+  filter(n_appointments  >= 2) %>%
+  select(ranking, icd10, description, n_pat, n_appointments) %>%
+  collect()
+
+```
+
+### Secondary Diagnoses
+```{r Secondary Diag}
+
+Secondary_Diags <- Overall_Cohort %>%
+  inner_join(IP_Filtered, by = "hesid") %>%
+  select(cohort, hesid, disdate, diag_02) %>%
+  rename(value = diag_02) %>%
+  filter(!is.na(value)) %>%
+  mutate(icd10 = substring(value,1,4)) %>%
+  inner_join(Full_Code_Lookup, by = "icd10") %>%
+  select(cohort, hesid, icd10, description) %>%
+  compute()
+
+Secondary_Ranking <- Primary_Diags %>%
+  count(hesid, cohort, icd10, description) %>%
+  ungroup() %>%
+  group_by(cohort, icd10, description) %>%
+    summarise(n_pat = as.numeric(n()),
+              n_appointments = as.numeric(sum(n))) %>%
+  ungroup() %>%
+  group_by(cohort) %>%
+    arrange(desc(n_appointments), desc(n_pat)) %>%
+    mutate(ranking = row_number()) %>%
+  ungroup() %>%
+  compute()
+
+Secondary_Diag_Adult_Rank <- Secondary_Ranking %>%
+  filter(cohort == 1) %>%
+  filter(n_appointments >= 3) %>%
+  select(ranking, icd10, description, n_pat, n_appointments) %>%
+  collect()
+  
+Secondary_Diag_Non_Adult_Rank <- Secondary_Ranking %>%
+  filter(cohort == 2) %>%
+  filter(n_appointments >= 2) %>%
+  select(ranking, icd10, description, n_pat, n_appointments) %>%
+  collect()
+
+```
+
+### Procedure Ranking
+```{r Procedures}
+Procedure_Names <- tbl(hes_con, in_schema(schema,"vantage_mapping_202111")) %>% 
+  filter(str_detect(category, "proc")) %>%
+  rename(opcs4 = code, desc4 = value) %>%
+  select(opcs4, description = desc4) %>%
+  compute
+
+# Important to filter out Primary Opernosis as well as NAs and blanks
+Procedures <- Overall_Cohort %>%
+  inner_join(IP_Pivoted, by = "hesid") %>%
+  filter(code_type == "oper") %>%
+  select(cohort, hesid, disdate, code_type, code) %>%
+  rename(value = code) %>%
+  filter(!is.na(value)) %>% 
+  filter(!value == "") %>%
+  mutate(opcs4 = substring(value,1,4)) %>%
+  left_join(Procedure_Names, by = "opcs4") %>%
+  select(cohort, hesid, opcs4, description) %>%
+  compute()
+
+Procedure_Ranking <- Procedures %>%
+  count(hesid, opcs4, cohort, description) %>%
+  ungroup() %>%
+  group_by(cohort, opcs4, description) %>%
+    summarise(n_pat = as.numeric(n()),
+              n_appointments = as.numeric(sum(n))) %>%
+  ungroup() %>%
+  group_by(cohort) %>%
+    arrange(desc(n_appointments), desc(n_pat)) %>%
+    mutate(ranking = row_number()) %>%
+  ungroup() %>%
+  compute()
+
+Procedures_Adult_Rank <- Procedure_Ranking %>%
+  filter(cohort == 1) %>%
+  filter(n_appointments >= 5) %>%
+  select(ranking, opcs4, description, n_pat, n_appointments) %>%
+  collect()
+  
+Procedures_Non_Adult_Rank <- Procedure_Ranking %>%
+  filter(cohort == 2) %>%
+  filter(n_appointments >= 3) %>%
+  select(ranking, opcs4, description, n_pat, n_appointments) %>%
+  collect()
+
+```
+
+
+### Treatment Specialities
+```{r}
+
+Tretspef_Names <- tbl(hes_con, in_schema(schema,"vantage_mapping_202111")) %>% 
+  filter(category == "tretspef") %>%
+  rename(tretspef = code, description = value) %>%
+  select(tretspef, description) %>%
+  compute()
+
+# Important to filter out Primary Diagnosis as well as NAs and blanks
+Tretspefs <- Overall_Cohort %>%
+  inner_join(IP_Filtered, by = "hesid") %>%
+  select(cohort, hesid, disdate, tretspef) %>%
+  inner_join(Tretspef_Names, by = "tretspef") %>%
+  select(cohort, hesid, tretspef, description) %>%
+  compute()
+
+Treatspef_Ranking <- Tretspefs %>%
+  count(hesid, cohort, description) %>%
+  ungroup() %>%
+  group_by(cohort, description) %>%
+    summarise(n_pat = as.numeric(n()),
+              n_appointments = as.numeric(sum(n))) %>%
+  ungroup() %>%
+  group_by(cohort) %>%
+    arrange(desc(n_appointments), desc(n_pat)) %>%
+    mutate(ranking = row_number()) %>%
+  ungroup() %>%
+  compute()  
+
+Treatspef_Adult_Rank <- Treatspef_Ranking %>%
+  filter(cohort == 1) %>%
+  filter(n_appointments >= 11) %>%
+  select(ranking, description, n_pat, n_appointments) %>%
+  collect()
+  
+Treatspef_Non_Adult_Rank <- Treatspef_Ranking %>%
+  filter(cohort == 2) %>%
+  filter(n_appointments >= 3) %>%
+  select(ranking, description, n_pat, n_appointments) %>%
+  collect()
+
+```
+
+## Write each table as a tab
+
+```{r}
+write.xlsx(list("Primary Diagnosis Adult" = Primary_Diag_Adult_Rank, 
+                "Primary Diagnosis Non-Adult" = Primary_Diag_Non_Adult_Rank, 
+                "Secondary Diagnosis Adult" = Secondary_Diag_Adult_Rank, 
+                "Secondary Diagnosis Non-Adult" = Secondary_Diag_Non_Adult_Rank, 
+                "Procedures Adult" = Procedures_Adult_Rank, 
+                "Procedures Non-Adult" = Procedures_Non_Adult_Rank, 
+                "Tretspef Adult" = Treatspef_Adult_Rank, 
+                "Tretspef Non-Adult" = Treatspef_Non_Adult_Rank), 
+           "Output/Ranked_Analysis.xlsx")
+```
+

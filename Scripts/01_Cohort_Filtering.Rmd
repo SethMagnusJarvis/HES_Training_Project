@@ -1,0 +1,189 @@
+---
+title: "PH1 HES Training - Inclusion 1 and filtering DF"
+author: "S Jarvis"
+date: "21/01/2022"
+output: html_document
+---
+
+```{r HiQ Logo,  echo=FALSE, message=FALSE, warning=FALSE}
+### DO NOT REMOVE ###
+htmltools::img(src = "https://www.healthiq.co.uk/images/healthiq-logo.svg", 
+               alt = 'logo', 
+               style = 'position:absolute; top:0; right:0; padding:10px;')
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r Load libraries}
+### Load basic database libraries
+library(RPostgreSQL)
+library(DBI)
+# Add other packages here:
+library(scales)
+library(tidyverse)
+library(lubridate) #package for date
+library(stringr)
+library(magrittr)
+library(openxlsx)
+library(dbplyr)
+library(RPostgres)
+library(odbc)
+library(janitor)
+library(kableExtra)
+library(ggplot2)
+library(AnalystsHIQ)
+library(data.table)
+library(DT)
+
+```
+
+```{r Format Table Function}
+Formatted_Table <- function(df){
+  
+  df %>%  
+    datatable(extensions = 'Buttons',
+                    rownames = FALSE,
+                    filter = "top",
+                 options = list(dom = 'Blfrtip',
+                                buttons = c('copy', 'csv', 'excel'),
+                                lengthMenu = list(c(10,25,50,-1),
+                                                  c(10,25,50,"All"))))
+}
+```
+
+
+```{r Connection set-up, echo=FALSE, include=FALSE}
+## This chunk should NEVER be included in anything that goes outside of Health iQ.
+# This function sets up your connection to the DB, please edit as appropriate
+hes_con <- DBI::dbConnect(
+  odbc::odbc(), 
+  Driver = "Amazon Redshift (x64)",
+  ### CHANGE WHICH DATABASE YOU WANT
+  Database = "hesdata_processed_hiq",
+  Server = "172.31.32.171",
+  Port = 5439,
+  ### CHANGE THIS TO YOUR DB USERNAME
+  UID = Sys.getenv("db_user"),
+  ### HiQ DB password (do not put your password in plain text here!)
+  PWD = keyring::key_get("cluster_access"))
+```
+
+### General Codes
+
+This uploads the general codes. 
+```{r Load Codes}
+schema <- "ph1_hes_training"
+
+IP_Full <- tbl(hes_con, in_schema("public","inpatient_mapping"))
+OP_Full <- tbl(hes_con, in_schema("public","outpatient_mapping"))
+
+codes <- tbl(hes_con, in_schema(schema, "lookup"))
+
+Start_Date <- ymd("2016-04-01")
+End_Date <- ymd("2020-12-31")
+
+inclusion_1 <- filter(codes, category == "Inclusion Part 1") %>% pull(code)
+inclusion_2 <- filter(codes, category == "Inclusion Part 2") %>% pull(code)
+IBD <- filter(codes, category == "IBD") %>% pull(code)
+
+codes %>% collect() %>% Formatted_Table()
+```
+
+## Cohort
+
+Inclusion criteria
+•	Universal PH1 cohort:
+o	ICD-10 code for PH1 (E74.8) in any position within Inpatient or Outpatient within the study period.
+o	Any coding for kidney stones (N20.0) or nephrocalcinosis (E83.5) in Inpatient or Outpatient at any point in the available data.
+•	Adult PH1 cohort:
+o	Patients within the Universal PH1 cohort aged 18 or older at the last date within the study period.
+•	Non-adult PH1 cohort
+o	Patients within the Universal PH1 cohort aged <18 years at the last date within the study period.
+
+3.3.3.2	Exclusion criteria
+The exclusion criteria for all cohorts are the following, as they constitute basic data quality issues:
+•	Age missing or recorded as >120
+•	Completely missing sex information, not including the “Not known” and “Not Specified” categories.
+
+
+### Patients Diagnosed With Ph1
+
+
+```{r Ph1 Diagnosis}
+# Firstly we want to identify patients E748 within our study period. E748 is "Other Specified Disorders of Carbohydrate Metabolism"
+
+#Inpatient
+Inc1_Pats_IP <- IP_Full %>%
+  filter(between(disdate, Start_Date, End_Date)) %>%
+  filter_diags(inclusion_1, collapse = TRUE) %>%
+  group_by(hesid) %>%
+  mutate(indexdate = min(disdate), 
+         age = min(if_else(endage >= 7000, 0, endage))) %>%
+  ungroup %>%
+  distinct(hesid, indexdate, age) %>%
+  compute()
+
+count(Inc1_Pats_IP)
+
+#Outpatient
+Inc1_Pats_OP <- OP_Full %>%
+  filter(between(apptdate, Start_Date, End_Date)) %>%
+  filter_diags(inclusion_1, collapse = TRUE) %>%
+  group_by(hesid) %>%
+  mutate(
+    indexdate = min(apptdate)) %>%
+  ungroup %>%
+  distinct(hesid, indexdate) %>%
+  compute()
+
+count(Inc1_Pats_OP)
+
+
+Inc1_Pats <- union(Inc1_Pats_IP,Inc1_Pats_OP) %>%
+  group_by(hesid) %>%
+  mutate(indexdate = min(indexdate),
+         age = min(age)) %>%
+  ungroup %>%
+  distinct(hesid, indexdate, age) %>%
+  compute_d(schema, "inc1_patients")
+
+count(Inc1_Pats)
+
+```
+
+### Create Filtered dataframes
+
+This filters the whole datasets to only include Ph1 Patients.
+
+```{r Filter Datasets}
+#Make a cut of data with just patients with ph1 for speed
+IP_Filtered <- IP_Full %>%
+  semi_join(Inc1_Pats, by = "hesid") %>%
+  compute_d(schema, "inpatient_mapping_ph1_pat")
+OP_Filtered <- OP_Full %>%
+  semi_join(Inc1_Pats, by = "hesid") %>%
+  compute_d(schema, "outpatient_mapping_ph1_pat")
+AE_Filtered <- tbl(hes_con, in_schema("public","aande_mapping")) %>%
+  semi_join(Inc1_Pats, by = "hesid") %>%
+  compute_d(schema, "aande_mapping_ph1_pat")
+
+IP_Pivoted <- IP_Filtered %>%
+  pivot_longer(starts_with(c("diag", "opertn")), names_to = "code_type", values_to = "code") %>%
+  filter(code != "") %>%
+  mutate(prim = case_when(code_type %in% c("diag_01", opertn_01) ~ 1,
+                               TRUE ~ 0), 
+         code_type = case_when(str_detect(code_type, "diag") ~ "diag",
+                               str_detect(code_type, "oper") ~ "oper",
+                                          TRUE ~ "none")) %>%
+  compute_d(schema, "inpatient_mapping_ph1_pat_pivot")
+
+OP_Pivoted <- OP_Filtered %>%
+  pivot_longer(starts_with(c("diag", "opertn")), names_to = "code_type", values_to = "code") %>%
+  filter(code != "") %>%
+  mutate(prim = case_when(code_type %in% c("diag_01", opertn_01) ~ 1,
+                               TRUE ~ 0), 
+         code_type = case_when(str_detect(code_type, "diag") ~ "diag",
+                               str_detect(code_type, "oper") ~ "oper",
+                                          TRUE ~ "none")) %>%
+  compute_d(schema, "outpatient_mapping_ph1_pat_pivot")
+```
